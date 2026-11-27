@@ -1027,7 +1027,7 @@ export function renderDashboardHtml(): string {
 
     .notes-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(256px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(min(256px, 100%), 1fr));
       gap: 14px;
     }
     .note-card {
@@ -1399,16 +1399,39 @@ export function renderDashboardHtml(): string {
     .toast.warn .toast-dot { background: var(--warn); }
 
     @media (max-width: 960px) {
-      .shell { grid-template-columns: 1fr; }
+      .shell {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: auto minmax(0, 1fr);
+      }
       .sidebar {
         position: static;
         height: auto;
         border-right: none;
         border-bottom: 1px solid var(--border);
       }
-      .nav-group { flex-direction: row; overflow-x: auto; }
-      .nav-item { width: auto; }
+      .nav-group {
+        flex: 0 0 auto;
+        flex-direction: row;
+        align-items: center;
+        overflow-x: auto;
+      }
+      .nav-item {
+        width: auto;
+        flex-shrink: 0;
+        white-space: nowrap;
+      }
       .nav-kbd { display: none; }
+      .topbar {
+        height: auto;
+        min-height: 48px;
+        padding: 8px 14px;
+        flex-wrap: wrap;
+      }
+      .topbar-actions { flex-wrap: wrap; }
+      .content { padding: 14px 14px 32px; }
+      .search-wrap { flex: 1; min-width: 150px; max-width: 100%; }
+      .search-input,
+      .search-input:focus { width: 100%; }
       .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .kpi-cell { border-bottom: 1px solid var(--border); }
       .event-row { grid-template-columns: 14px 86px minmax(0, 1fr); }
