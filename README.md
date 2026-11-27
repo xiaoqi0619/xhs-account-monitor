@@ -1,5 +1,7 @@
 # 小红书监控系统 (XHS Account Monitor v2.0)
 
+> **平台支持**：目前仅完整适配并在 **Windows 10 / 11** 上实机验证，**macOS / Linux 暂未适配**。
+
 专为小红书目标账号打造的 **本地全量存档、三态分层监控、变动时间对比、次日 0 点「昨天 HH:mm」精确时间对照汇总** 系统，配套 Linear 极简风格本地 Web 控制台与 Bark / QQ 邮箱双通道提醒。
 
 项目仅依赖 Node.js v24 原生能力（内置 TypeScript 执行与 `node:sqlite`）及极少量核心包，支持多账号独立数据隔离，并已通过 `.gitignore` 严格隔离本地隐私配置与抓取数据，可直接开源部署或上传 GitHub。
@@ -135,6 +137,7 @@ xhs-account-monitor/
 ## 快速开始
 
 ### 环境要求
+- **操作系统**：**Windows 10 / 11**（macOS / Linux 暂未适配）
 - **Node.js `v24+`**（使用原生 TypeScript 执行与内置 `node:sqlite`）
 - 本机安装有 **Google Chrome**（或 Microsoft Edge）
 
