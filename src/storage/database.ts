@@ -222,6 +222,7 @@ export class MonitorDatabase {
 
       CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL DEFAULT '',
         event_type TEXT NOT NULL,
         title TEXT NOT NULL,
         body TEXT NOT NULL,
@@ -242,6 +243,7 @@ export class MonitorDatabase {
 
       CREATE TABLE IF NOT EXISTS comparison_records (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL DEFAULT '',
         date_key TEXT NOT NULL,
         compare_type TEXT NOT NULL,
         note_id TEXT NOT NULL,
@@ -265,6 +267,7 @@ export class MonitorDatabase {
 
       CREATE TABLE IF NOT EXISTS time_reconciliations (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL DEFAULT '',
         target_date_key TEXT NOT NULL,
         item_type TEXT NOT NULL,
         target_id TEXT NOT NULL,
@@ -289,15 +292,18 @@ export class MonitorDatabase {
       CREATE INDEX IF NOT EXISTS idx_reconcile_date ON time_reconciliations(target_date_key, status);
 
       CREATE TABLE IF NOT EXISTS daily_reports (
-        date_key TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL DEFAULT '',
+        date_key TEXT NOT NULL,
         generated_at TEXT NOT NULL,
         is_next_day_verified INTEGER NOT NULL DEFAULT 1,
         markdown_path TEXT NOT NULL,
-        report_json TEXT NOT NULL
+        report_json TEXT NOT NULL,
+        PRIMARY KEY (user_id, date_key)
       );
 
       CREATE TABLE IF NOT EXISTS patrol_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL DEFAULT '',
         run_type TEXT NOT NULL,
         status TEXT NOT NULL,
         notes_scanned INTEGER NOT NULL DEFAULT 0,
@@ -577,6 +583,175 @@ export class MonitorDatabase {
         }
       }
     }
+
+    // 兼容升级已有数据库：为多账号隔离平滑补充 user_id 字段并自动归属历史记录（不丢失任何历史数据）
+    const ensureUserIdCol = (table: string) => {
+      const cols = new Set(
+        (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
+          (c) => c.name
+        )
+      );
+      if (!cols.has('user_id')) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN user_id TEXT NOT NULL DEFAULT '';`);
+      }
+    };
+    ensureUserIdCol('events');
+    ensureUserIdCol('comparison_records');
+    ensureUserIdCol('time_reconciliations');
+    ensureUserIdCol('patrol_runs');
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id, id DESC);
+      CREATE INDEX IF NOT EXISTS idx_comparisons_user ON comparison_records(user_id, id DESC);
+      CREATE INDEX IF NOT EXISTS idx_reconcile_user_date ON time_reconciliations(user_id, target_date_key, status);
+      CREATE INDEX IF NOT EXISTS idx_patrol_user_date ON patrol_runs(user_id, date_key);
+    `);
+
+    // 兼容升级 daily_reports 表为按 (user_id, date_key) 复合主键隔离
+    const dailyCols = new Set(
+      (this.db.prepare('PRAGMA table_info(daily_reports)').all() as Array<{ name: string }>).map(
+        (c) => c.name
+      )
+    );
+    if (!dailyCols.has('user_id')) {
+      const oldReports = this.db
+        .prepare(
+          'SELECT date_key, generated_at, is_next_day_verified, markdown_path, report_json FROM daily_reports'
+        )
+        .all() as Array<{
+        date_key: string;
+        generated_at: string;
+        is_next_day_verified: number;
+        markdown_path: string;
+        report_json: string;
+      }>;
+      this.db.exec(`
+        DROP TABLE daily_reports;
+        CREATE TABLE daily_reports (
+          user_id TEXT NOT NULL DEFAULT '',
+          date_key TEXT NOT NULL,
+          generated_at TEXT NOT NULL,
+          is_next_day_verified INTEGER NOT NULL DEFAULT 1,
+          markdown_path TEXT NOT NULL,
+          report_json TEXT NOT NULL,
+          PRIMARY KEY (user_id, date_key)
+        );
+      `);
+      for (const r of oldReports) {
+        let uid = '';
+        try {
+          const parsed = JSON.parse(String(r.report_json)) as DailyAnalyticsReport;
+          uid = parsed?.account?.userId || '';
+        } catch {
+          // ignore
+        }
+        this.db
+          .prepare(
+            `INSERT OR REPLACE INTO daily_reports (user_id, date_key, generated_at, is_next_day_verified, markdown_path, report_json)
+             VALUES (?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            uid,
+            String(r.date_key),
+            String(r.generated_at),
+            Number(r.is_next_day_verified || 0),
+            String(r.markdown_path || ''),
+            String(r.report_json)
+          );
+      }
+    }
+
+    // 为历史空 user_id 的 events / comparison_records / time_reconciliations / patrol_runs 自动归属原所属账号
+    const inferUserId = (noteId: string | null, atIso: string): string => {
+      if (noteId) {
+        const noteRow = this.db
+          .prepare('SELECT user_id FROM notes WHERE note_id = ?')
+          .get(noteId) as { user_id: string } | undefined;
+        if (noteRow?.user_id) return String(noteRow.user_id);
+        const synMatch = noteId.match(/^(?:ip|avatar|profile_(?:nickname|gender|bio))_([a-zA-Z0-9_-]+)$/);
+        if (synMatch?.[1]) return synMatch[1];
+      }
+      const beforeSnap = this.db
+        .prepare(
+          "SELECT user_id FROM profile_snapshots WHERE user_id != '' AND captured_at <= ? ORDER BY captured_at DESC, id DESC LIMIT 1"
+        )
+        .get(atIso) as { user_id: string } | undefined;
+      if (beforeSnap?.user_id) return String(beforeSnap.user_id);
+      const firstSnap = this.db
+        .prepare("SELECT user_id FROM profile_snapshots WHERE user_id != '' ORDER BY id ASC LIMIT 1")
+        .get() as { user_id: string } | undefined;
+      return firstSnap?.user_id ? String(firstSnap.user_id) : '';
+    };
+
+    const legacyEvents = this.db
+      .prepare("SELECT id, note_id, created_at FROM events WHERE user_id = '' OR user_id IS NULL")
+      .all() as Array<{ id: number; note_id: string | null; created_at: string }>;
+    for (const ev of legacyEvents) {
+      const uid = inferUserId(ev.note_id ? String(ev.note_id) : null, String(ev.created_at));
+      if (uid) {
+        this.db.prepare('UPDATE events SET user_id = ? WHERE id = ?').run(uid, Number(ev.id));
+      }
+    }
+
+    const legacyComps = this.db
+      .prepare(
+        "SELECT id, note_id, created_at FROM comparison_records WHERE user_id = '' OR user_id IS NULL"
+      )
+      .all() as Array<{ id: number; note_id: string | null; created_at: string }>;
+    for (const cp of legacyComps) {
+      const uid = inferUserId(cp.note_id ? String(cp.note_id) : null, String(cp.created_at));
+      if (uid) {
+        this.db
+          .prepare('UPDATE comparison_records SET user_id = ? WHERE id = ?')
+          .run(uid, Number(cp.id));
+      }
+    }
+
+    const legacyRecs = this.db
+      .prepare(
+        "SELECT id, note_id, local_recorded_at FROM time_reconciliations WHERE user_id = '' OR user_id IS NULL"
+      )
+      .all() as Array<{ id: number; note_id: string | null; local_recorded_at: string }>;
+    for (const rc of legacyRecs) {
+      const uid = inferUserId(
+        rc.note_id ? String(rc.note_id) : null,
+        String(rc.local_recorded_at)
+      );
+      if (uid) {
+        this.db
+          .prepare('UPDATE time_reconciliations SET user_id = ? WHERE id = ?')
+          .run(uid, Number(rc.id));
+      }
+    }
+
+    const legacyPatrols = this.db
+      .prepare("SELECT id, finished_at FROM patrol_runs WHERE user_id = '' OR user_id IS NULL")
+      .all() as Array<{ id: number; finished_at: string }>;
+    for (const pr of legacyPatrols) {
+      const uid = inferUserId(null, String(pr.finished_at));
+      if (uid) {
+        this.db.prepare('UPDATE patrol_runs SET user_id = ? WHERE id = ?').run(uid, Number(pr.id));
+      }
+    }
+
+    // 按账号回填独立建档标记 baseline_completed_at:<userId>，防止切回旧账号时误重跑首次建档
+    const baselineNoteUsers = this.db
+      .prepare(
+        "SELECT user_id, MIN(first_seen_at) AS first_at FROM notes WHERE user_id != '' AND is_baseline = 1 GROUP BY user_id"
+      )
+      .all() as Array<{ user_id: string; first_at: string }>;
+    for (const row of baselineNoteUsers) {
+      const uid = String(row.user_id);
+      if (!this.getMeta(`baseline_completed_at:${uid}`)) {
+        this.setMeta(`baseline_completed_at:${uid}`, String(row.first_at || nowIso()));
+      }
+    }
+    const legacyBaseUid = this.getMeta('baseline_user_id');
+    if (legacyBaseUid && !this.getMeta(`baseline_completed_at:${legacyBaseUid}`)) {
+      this.setMeta(
+        `baseline_completed_at:${legacyBaseUid}`,
+        this.getMeta('baseline_completed_at') || nowIso()
+      );
+    }
   }
 
   close(): void {
@@ -603,10 +778,24 @@ export class MonitorDatabase {
 
   isBaselineCompletedForUser(userId: string | null): boolean {
     if (!userId) return false;
-    return this.getMeta('baseline_user_id') === userId;
+    return (
+      Boolean(this.getMeta(`baseline_completed_at:${userId}`)) ||
+      this.getMeta('baseline_user_id') === userId
+    );
+  }
+
+  getBaselineCompletedAt(userId: string | null): string | null {
+    if (!userId) return null;
+    const perUser = this.getMeta(`baseline_completed_at:${userId}`);
+    if (perUser) return perUser;
+    if (this.getMeta('baseline_user_id') === userId) {
+      return this.getMeta('baseline_completed_at');
+    }
+    return null;
   }
 
   markBaselineCompleted(userId: string, atIso = nowIso()): void {
+    this.setMeta(`baseline_completed_at:${userId}`, atIso);
     this.setMeta('baseline_user_id', userId);
     this.setMeta('baseline_completed_at', atIso);
   }
@@ -1025,11 +1214,21 @@ export class MonitorDatabase {
     return rows.map((r) => this.mapNoteRow(r));
   }
 
-  getNotesByFirstSeenDate(dateKey: string, includeBaseline = false): StoredNoteRow[] {
-    const sql = includeBaseline
-      ? 'SELECT * FROM notes WHERE first_seen_date_key = ? ORDER BY first_seen_at ASC'
-      : 'SELECT * FROM notes WHERE first_seen_date_key = ? AND is_baseline = 0 ORDER BY first_seen_at ASC';
-    const rows = this.db.prepare(sql).all(dateKey) as Array<Record<string, unknown>>;
+  getNotesByFirstSeenDate(
+    dateKey: string,
+    includeBaseline = false,
+    userId?: string
+  ): StoredNoteRow[] {
+    const conds = ['first_seen_date_key = ?'];
+    const params: Array<string | number> = [dateKey];
+    if (!includeBaseline) conds.push('is_baseline = 0');
+    if (userId) {
+      conds.push('user_id = ?');
+      params.push(userId);
+    }
+    const rows = this.db
+      .prepare(`SELECT * FROM notes WHERE ${conds.join(' AND ')} ORDER BY first_seen_at ASC`)
+      .all(...params) as Array<Record<string, unknown>>;
     return rows.map((r) => this.mapNoteRow(r));
   }
 
@@ -1267,14 +1466,23 @@ export class MonitorDatabase {
       .run(editedAtMs, editedTimeText, renderedTimeText, renderedTimeText, Number(latest.id));
   }
 
-  getEditedNoteIdsForDate(dateKey: string): string[] {
+  getEditedNoteIdsForDate(dateKey: string, userId?: string): string[] {
     const { startIso, endIso } = getLocalDayBoundsIso(dateKey);
-    const rows = this.db
-      .prepare(
-        `SELECT DISTINCT note_id FROM note_revisions
-         WHERE changed_at >= ? AND changed_at <= ?`
-      )
-      .all(startIso, endIso) as Array<{ note_id: string }>;
+    const rows = (userId
+      ? this.db
+          .prepare(
+            `SELECT DISTINCT r.note_id
+             FROM note_revisions r
+             INNER JOIN notes n ON r.note_id = n.note_id
+             WHERE r.changed_at >= ? AND r.changed_at <= ? AND n.user_id = ?`
+          )
+          .all(startIso, endIso, userId)
+      : this.db
+          .prepare(
+            `SELECT DISTINCT note_id FROM note_revisions
+             WHERE changed_at >= ? AND changed_at <= ?`
+          )
+          .all(startIso, endIso)) as Array<{ note_id: string }>;
     return rows.map((r) => String(r.note_id));
   }
 
@@ -1406,11 +1614,24 @@ export class MonitorDatabase {
     return row ? this.mapCommentRow(row) : null;
   }
 
-  getCommentsByFirstSeenDate(dateKey: string, includeBaseline = false): StoredCommentRow[] {
-    const sql = includeBaseline
-      ? 'SELECT * FROM comments WHERE first_seen_date_key = ? ORDER BY first_seen_at ASC'
-      : 'SELECT * FROM comments WHERE first_seen_date_key = ? AND is_baseline = 0 ORDER BY first_seen_at ASC';
-    const rows = this.db.prepare(sql).all(dateKey) as Array<Record<string, unknown>>;
+  getCommentsByFirstSeenDate(
+    dateKey: string,
+    includeBaseline = false,
+    userId?: string
+  ): StoredCommentRow[] {
+    const conds = ['c.first_seen_date_key = ?'];
+    const params: Array<string | number> = [dateKey];
+    if (!includeBaseline) conds.push('c.is_baseline = 0');
+    const join = userId ? 'INNER JOIN notes n ON c.note_id = n.note_id' : '';
+    if (userId) {
+      conds.push('n.user_id = ?');
+      params.push(userId);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT c.* FROM comments c ${join} WHERE ${conds.join(' AND ')} ORDER BY c.first_seen_at ASC`
+      )
+      .all(...params) as Array<Record<string, unknown>>;
     return rows.map((r) => this.mapCommentRow(r));
   }
 
@@ -1492,15 +1713,17 @@ export class MonitorDatabase {
   // ==================== Events ====================
   insertEvent(ev: MonitorEvent): MonitorEvent {
     const dateKey = getLocalDateKey(ev.createdAt);
+    const userId = ev.userId || '';
     const res = this.db
       .prepare(
         `INSERT INTO events (
-          event_type, title, body, note_id, comment_id,
+          user_id, event_type, title, body, note_id, comment_id,
           level, should_push, triggers_burst, is_activity,
           before_json, after_json, date_key, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
+        userId,
         ev.eventType,
         ev.title,
         ev.body,
@@ -1515,7 +1738,7 @@ export class MonitorDatabase {
         dateKey,
         ev.createdAt
       );
-    return { ...ev, id: Number(res.lastInsertRowid) };
+    return { ...ev, userId, id: Number(res.lastInsertRowid) };
   }
 
   updateEventPushStatus(eventId: number, pushed: boolean, pushError?: string): void {
@@ -1524,16 +1747,25 @@ export class MonitorDatabase {
       .run(pushed ? 1 : 0, pushError || null, eventId);
   }
 
-  getRecentEvents(limit = 80, dateKey?: string): MonitorEvent[] {
-    const rows = (dateKey
-      ? this.db
-          .prepare('SELECT * FROM events WHERE date_key = ? ORDER BY id DESC LIMIT ?')
-          .all(dateKey, limit)
-      : this.db
-          .prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?')
-          .all(limit)) as Array<Record<string, unknown>>;
+  getRecentEvents(limit = 80, dateKey?: string, userId?: string): MonitorEvent[] {
+    const conds: string[] = [];
+    const params: Array<string | number> = [];
+    if (userId) {
+      conds.push('user_id = ?');
+      params.push(userId);
+    }
+    if (dateKey) {
+      conds.push('date_key = ?');
+      params.push(dateKey);
+    }
+    const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+    params.push(limit);
+    const rows = this.db
+      .prepare(`SELECT * FROM events ${where} ORDER BY id DESC LIMIT ?`)
+      .all(...params) as Array<Record<string, unknown>>;
     return rows.map((r) => ({
       id: Number(r.id),
+      userId: String(r.user_id || ''),
       eventType: String(r.event_type) as MonitorEvent['eventType'],
       title: String(r.title),
       body: String(r.body),
@@ -1551,15 +1783,22 @@ export class MonitorDatabase {
     }));
   }
 
-  getEventsForDate(dateKey: string): MonitorEvent[] {
+  getEventsForDate(dateKey: string, userId?: string): MonitorEvent[] {
     const { startIso, endIso } = getLocalDayBoundsIso(dateKey);
-    const rows = this.db
-      .prepare(
-        'SELECT * FROM events WHERE date_key = ? OR (created_at >= ? AND created_at <= ?) ORDER BY id ASC'
-      )
-      .all(dateKey, startIso, endIso) as Array<Record<string, unknown>>;
+    const rows = (userId
+      ? this.db
+          .prepare(
+            'SELECT * FROM events WHERE user_id = ? AND (date_key = ? OR (created_at >= ? AND created_at <= ?)) ORDER BY id ASC'
+          )
+          .all(userId, dateKey, startIso, endIso)
+      : this.db
+          .prepare(
+            'SELECT * FROM events WHERE date_key = ? OR (created_at >= ? AND created_at <= ?) ORDER BY id ASC'
+          )
+          .all(dateKey, startIso, endIso)) as Array<Record<string, unknown>>;
     return rows.map((r) => ({
       id: Number(r.id),
+      userId: String(r.user_id || ''),
       eventType: String(r.event_type) as MonitorEvent['eventType'],
       title: String(r.title),
       body: String(r.body),
@@ -1575,17 +1814,19 @@ export class MonitorDatabase {
 
   // ==================== Comparison Records ====================
   insertComparisonRecord(rec: ComparisonRecord): ComparisonRecord {
+    const userId = rec.userId || '';
     const res = this.db
       .prepare(
         `INSERT INTO comparison_records (
-          date_key, compare_type, note_id, comment_id, note_title, author_nickname,
+          user_id, date_key, compare_type, note_id, comment_id, note_title, author_nickname,
           local_saved_content, new_content_if_edited, local_photo_paths_json,
           note_publish_time, comment_publish_time, first_captured_time,
           last_seen_alive_time, detected_change_time, estimated_action_time_text,
           survival_minutes, summary_text, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
+        userId,
         rec.dateKey,
         rec.compareType,
         rec.noteId,
@@ -1605,16 +1846,21 @@ export class MonitorDatabase {
         rec.summaryText,
         rec.detectedChangeTime || nowIso()
       );
-    return { ...rec, id: Number(res.lastInsertRowid) };
+    return { ...rec, userId, id: Number(res.lastInsertRowid) };
   }
 
   getComparisonRecords(opts?: {
+    userId?: string;
     dateKey?: string;
     compareType?: string;
     limit?: number;
   }): ComparisonRecord[] {
     const conds: string[] = [];
     const params: Array<string | number> = [];
+    if (opts?.userId) {
+      conds.push('user_id = ?');
+      params.push(opts.userId);
+    }
     if (opts?.dateKey) {
       conds.push('date_key = ?');
       params.push(opts.dateKey);
@@ -1633,6 +1879,7 @@ export class MonitorDatabase {
 
     return rows.map((r) => ({
       id: Number(r.id),
+      userId: String(r.user_id || ''),
       dateKey: String(r.date_key),
       compareType: String(r.compare_type) as ComparisonRecord['compareType'],
       noteId: String(r.note_id),
@@ -1658,16 +1905,18 @@ export class MonitorDatabase {
 
   // ==================== Time Reconciliations ====================
   upsertTimeReconciliation(item: TimeReconciliationItem): void {
+    const userId = item.userId || '';
     this.db
       .prepare(
         `INSERT INTO time_reconciliations (
-          target_date_key, item_type, target_id, note_id, title_or_excerpt, author_nickname,
+          user_id, target_date_key, item_type, target_id, note_id, title_or_excerpt, author_nickname,
           local_recorded_at, same_day_platform_time_text, same_day_estimated_ms,
           next_day_verified_time_text, verified_platform_ms,
           capture_delay_minutes, estimate_error_minutes, diff_minutes,
           status, anomaly_reason, review_note, checked_at, reviewed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(target_date_key, item_type, target_id) DO UPDATE SET
+          user_id = CASE WHEN excluded.user_id != '' THEN excluded.user_id ELSE time_reconciliations.user_id END,
           title_or_excerpt = excluded.title_or_excerpt,
           next_day_verified_time_text = excluded.next_day_verified_time_text,
           verified_platform_ms = excluded.verified_platform_ms,
@@ -1679,6 +1928,7 @@ export class MonitorDatabase {
           checked_at = excluded.checked_at`
       )
       .run(
+        userId,
         item.targetDateKey,
         item.itemType,
         item.targetId,
@@ -1701,19 +1951,26 @@ export class MonitorDatabase {
       );
   }
 
-  getTimeReconciliations(dateKey?: string): TimeReconciliationItem[] {
-    const rows = (dateKey
-      ? this.db
-          .prepare(
-            'SELECT * FROM time_reconciliations WHERE target_date_key = ? ORDER BY local_recorded_at ASC'
-          )
-          .all(dateKey)
-      : this.db
-          .prepare('SELECT * FROM time_reconciliations ORDER BY id DESC LIMIT 120')
-          .all()) as Array<Record<string, unknown>>;
+  getTimeReconciliations(dateKey?: string, userId?: string): TimeReconciliationItem[] {
+    const conds: string[] = [];
+    const params: Array<string | number> = [];
+    if (userId) {
+      conds.push('user_id = ?');
+      params.push(userId);
+    }
+    if (dateKey) {
+      conds.push('target_date_key = ?');
+      params.push(dateKey);
+    }
+    const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+    const orderAndLimit = dateKey ? 'ORDER BY local_recorded_at ASC' : 'ORDER BY id DESC LIMIT 120';
+    const rows = this.db
+      .prepare(`SELECT * FROM time_reconciliations ${where} ${orderAndLimit}`)
+      .all(...params) as Array<Record<string, unknown>>;
 
     return rows.map((r) => ({
       id: Number(r.id),
+      userId: String(r.user_id || ''),
       targetDateKey: String(r.target_date_key),
       itemType: String(r.item_type) as 'NOTE' | 'COMMENT',
       targetId: String(r.target_id),
@@ -1761,17 +2018,19 @@ export class MonitorDatabase {
 
   // ==================== Daily Reports & Patrol Runs ====================
   saveDailyReport(report: DailyAnalyticsReport): void {
+    const userId = report.account?.userId || '';
     this.db
       .prepare(
-        `INSERT INTO daily_reports (date_key, generated_at, is_next_day_verified, markdown_path, report_json)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(date_key) DO UPDATE SET
+        `INSERT INTO daily_reports (user_id, date_key, generated_at, is_next_day_verified, markdown_path, report_json)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(user_id, date_key) DO UPDATE SET
            generated_at = excluded.generated_at,
            is_next_day_verified = excluded.is_next_day_verified,
            markdown_path = excluded.markdown_path,
            report_json = excluded.report_json`
       )
       .run(
+        userId,
         report.dateKey,
         report.generatedAt,
         report.isNextDayVerified ? 1 : 0,
@@ -1780,19 +2039,33 @@ export class MonitorDatabase {
       );
   }
 
-  getDailyReport(dateKey: string): DailyAnalyticsReport | null {
-    const row = this.db
-      .prepare('SELECT report_json FROM daily_reports WHERE date_key = ?')
-      .get(dateKey) as { report_json: string } | undefined;
+  getDailyReport(dateKey: string, userId?: string): DailyAnalyticsReport | null {
+    const row = (userId
+      ? this.db
+          .prepare('SELECT report_json FROM daily_reports WHERE user_id = ? AND date_key = ?')
+          .get(userId, dateKey)
+      : this.db
+          .prepare(
+            'SELECT report_json FROM daily_reports WHERE date_key = ? ORDER BY generated_at DESC LIMIT 1'
+          )
+          .get(dateKey)) as { report_json: string } | undefined;
     return row ? (JSON.parse(row.report_json) as DailyAnalyticsReport) : null;
   }
 
-  listDailyReportDates(): Array<{ dateKey: string; generatedAt: string; isNextDayVerified: boolean }> {
-    const rows = this.db
-      .prepare(
-        'SELECT date_key, generated_at, is_next_day_verified FROM daily_reports ORDER BY date_key DESC LIMIT 60'
-      )
-      .all() as Array<Record<string, unknown>>;
+  listDailyReportDates(
+    userId?: string
+  ): Array<{ dateKey: string; generatedAt: string; isNextDayVerified: boolean }> {
+    const rows = (userId
+      ? this.db
+          .prepare(
+            'SELECT date_key, generated_at, is_next_day_verified FROM daily_reports WHERE user_id = ? ORDER BY date_key DESC LIMIT 60'
+          )
+          .all(userId)
+      : this.db
+          .prepare(
+            'SELECT date_key, generated_at, is_next_day_verified FROM daily_reports ORDER BY date_key DESC LIMIT 60'
+          )
+          .all()) as Array<Record<string, unknown>>;
     return rows.map((r) => ({
       dateKey: String(r.date_key),
       generatedAt: String(r.generated_at),
@@ -1801,6 +2074,7 @@ export class MonitorDatabase {
   }
 
   recordPatrolRun(params: {
+    userId?: string;
     runType: string;
     status: string;
     notesScanned: number;
@@ -1814,10 +2088,11 @@ export class MonitorDatabase {
     this.db
       .prepare(
         `INSERT INTO patrol_runs (
-          run_type, status, notes_scanned, comments_scanned, events_count, error_msg, date_key, started_at, finished_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          user_id, run_type, status, notes_scanned, comments_scanned, events_count, error_msg, date_key, started_at, finished_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
+        params.userId || '',
         params.runType,
         params.status,
         params.notesScanned,
@@ -1830,14 +2105,20 @@ export class MonitorDatabase {
       );
   }
 
-  countPatrolRunsForDate(dateKey: string): number {
-    const row = this.db
-      .prepare("SELECT COUNT(*) AS cnt FROM patrol_runs WHERE date_key = ? AND status = 'OK'")
-      .get(dateKey) as { cnt: number } | undefined;
+  countPatrolRunsForDate(dateKey: string, userId?: string): number {
+    const row = (userId
+      ? this.db
+          .prepare(
+            "SELECT COUNT(*) AS cnt FROM patrol_runs WHERE user_id = ? AND date_key = ? AND status = 'OK'"
+          )
+          .get(userId, dateKey)
+      : this.db
+          .prepare("SELECT COUNT(*) AS cnt FROM patrol_runs WHERE date_key = ? AND status = 'OK'")
+          .get(dateKey)) as { cnt: number } | undefined;
     return row ? Number(row.cnt) : 0;
   }
 
-  getArchiveStats(): {
+  getArchiveStats(userId?: string): {
     totalNotes: number;
     activeNotes: number;
     deletedNotes: number;
@@ -1853,48 +2134,96 @@ export class MonitorDatabase {
     profileFieldHistoryCount: number;
     profileFieldChangeCount: number;
   } {
-    const nRow = this.db
-      .prepare(
-        `SELECT
-          COUNT(*) AS total,
-          SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) AS active,
-          SUM(CASE WHEN status = 'DELETED' THEN 1 ELSE 0 END) AS deleted,
-          SUM(CASE WHEN last_edited_time_text != '' OR edit_count > 0 THEN 1 ELSE 0 END) AS edited,
-          SUM(CASE WHEN is_baseline = 1 THEN 1 ELSE 0 END) AS baseline
-         FROM notes`
-      )
-      .get() as Record<string, number>;
-    const cRow = this.db
-      .prepare(
-        `SELECT
-          COUNT(*) AS total,
-          SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) AS active,
-          SUM(CASE WHEN status = 'DELETED' THEN 1 ELSE 0 END) AS deleted
-         FROM comments`
-      )
-      .get() as Record<string, number>;
-    const compRow = this.db
-      .prepare('SELECT COUNT(*) AS cnt FROM comparison_records')
-      .get() as { cnt: number };
-    const recRow = this.db
-      .prepare('SELECT COUNT(*) AS cnt FROM time_reconciliations')
-      .get() as { cnt: number };
-    const ipRow = this.db
-      .prepare(
-        `SELECT
-          COUNT(*) AS total,
-          SUM(CASE WHEN previous_ip IS NOT NULL THEN 1 ELSE 0 END) AS changes
-         FROM ip_history`
-      )
-      .get() as Record<string, number>;
-    const pfRow = this.db
-      .prepare(
-        `SELECT
-          COUNT(*) AS total,
-          SUM(CASE WHEN old_value IS NOT NULL THEN 1 ELSE 0 END) AS changes
-         FROM profile_field_history`
-      )
-      .get() as Record<string, number>;
+    const nRow = (userId
+      ? this.db
+          .prepare(
+            `SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) AS active,
+              SUM(CASE WHEN status = 'DELETED' THEN 1 ELSE 0 END) AS deleted,
+              SUM(CASE WHEN last_edited_time_text != '' OR edit_count > 0 THEN 1 ELSE 0 END) AS edited,
+              SUM(CASE WHEN is_baseline = 1 THEN 1 ELSE 0 END) AS baseline
+             FROM notes WHERE user_id = ?`
+          )
+          .get(userId)
+      : this.db
+          .prepare(
+            `SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) AS active,
+              SUM(CASE WHEN status = 'DELETED' THEN 1 ELSE 0 END) AS deleted,
+              SUM(CASE WHEN last_edited_time_text != '' OR edit_count > 0 THEN 1 ELSE 0 END) AS edited,
+              SUM(CASE WHEN is_baseline = 1 THEN 1 ELSE 0 END) AS baseline
+             FROM notes`
+          )
+          .get()) as Record<string, number>;
+    const cRow = (userId
+      ? this.db
+          .prepare(
+            `SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN c.status = 'ACTIVE' THEN 1 ELSE 0 END) AS active,
+              SUM(CASE WHEN c.status = 'DELETED' THEN 1 ELSE 0 END) AS deleted
+             FROM comments c
+             INNER JOIN notes n ON c.note_id = n.note_id
+             WHERE n.user_id = ?`
+          )
+          .get(userId)
+      : this.db
+          .prepare(
+            `SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) AS active,
+              SUM(CASE WHEN status = 'DELETED' THEN 1 ELSE 0 END) AS deleted
+             FROM comments`
+          )
+          .get()) as Record<string, number>;
+    const compRow = (userId
+      ? this.db
+          .prepare('SELECT COUNT(*) AS cnt FROM comparison_records WHERE user_id = ?')
+          .get(userId)
+      : this.db.prepare('SELECT COUNT(*) AS cnt FROM comparison_records').get()) as { cnt: number };
+    const recRow = (userId
+      ? this.db
+          .prepare('SELECT COUNT(*) AS cnt FROM time_reconciliations WHERE user_id = ?')
+          .get(userId)
+      : this.db.prepare('SELECT COUNT(*) AS cnt FROM time_reconciliations').get()) as {
+      cnt: number;
+    };
+    const ipRow = (userId
+      ? this.db
+          .prepare(
+            `SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN previous_ip IS NOT NULL THEN 1 ELSE 0 END) AS changes
+             FROM ip_history WHERE user_id = ?`
+          )
+          .get(userId)
+      : this.db
+          .prepare(
+            `SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN previous_ip IS NOT NULL THEN 1 ELSE 0 END) AS changes
+             FROM ip_history`
+          )
+          .get()) as Record<string, number>;
+    const pfRow = (userId
+      ? this.db
+          .prepare(
+            `SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN old_value IS NOT NULL THEN 1 ELSE 0 END) AS changes
+             FROM profile_field_history WHERE user_id = ?`
+          )
+          .get(userId)
+      : this.db
+          .prepare(
+            `SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN old_value IS NOT NULL THEN 1 ELSE 0 END) AS changes
+             FROM profile_field_history`
+          )
+          .get()) as Record<string, number>;
 
     return {
       totalNotes: Number(nRow?.total || 0),

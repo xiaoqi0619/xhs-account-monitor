@@ -320,13 +320,13 @@ export async function processCollectResult(
   const emittedComparisons: ComparisonRecord[] = [];
 
   const pushEvent = (ev: Omit<MonitorEvent, 'createdAt'>) => {
-    const stored = db.insertEvent({ ...ev, createdAt: runNow });
+    const stored = db.insertEvent({ ...ev, userId: profile.userId, createdAt: runNow });
     appendEventLogFile(dateKey, stored as unknown as Record<string, unknown>);
     emittedEvents.push(stored);
   };
 
   const pushComparison = (comp: ComparisonRecord) => {
-    const stored = db.insertComparisonRecord(comp);
+    const stored = db.insertComparisonRecord({ ...comp, userId: profile.userId });
     appendComparisonLogFile(dateKey, stored as unknown as Record<string, unknown>);
     emittedComparisons.push(stored);
   };
@@ -1487,7 +1487,7 @@ export async function processCollectResult(
   // 5. 若为首次全量建档，标记基线完成并写入建档完成事件
   if (isBaselineRun) {
     db.markBaselineCompleted(profile.userId, runNow);
-    const stats = db.getArchiveStats();
+    const stats = db.getArchiveStats(profile.userId);
     pushEvent({
       eventType: 'BASELINE_READY',
       title: `【首次全量存档完成】${displayName}`,

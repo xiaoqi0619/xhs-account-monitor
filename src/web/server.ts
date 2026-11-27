@@ -3,7 +3,12 @@ import path from 'node:path';
 import { Hono } from 'hono';
 import type { MonitorScheduler } from '../engine/scheduler.ts';
 import { PHOTOS_ROOT, STORAGE_ROOT } from '../shared/paths.ts';
-import { getLocalDateKey, getYesterdayDateKey, saveConfig } from '../shared/utils.ts';
+import {
+  extractUserIdFromProfileUrl,
+  getLocalDateKey,
+  getYesterdayDateKey,
+  saveConfig,
+} from '../shared/utils.ts';
 import type { MonitorDatabase } from '../storage/database.ts';
 import { renderDashboardHtml } from './ui.ts';
 
@@ -52,16 +57,41 @@ export function createWebApp(db: MonitorDatabase, scheduler: MonitorScheduler): 
     });
   });
 
+  const getActiveUserId = (): string | undefined => {
+    const cfg = scheduler.getConfig();
+    const uidFromUrl = extractUserIdFromProfileUrl(cfg.targetProfileUrl);
+    if (uidFromUrl) return uidFromUrl;
+    return db.getLatestProfile()?.userId || undefined;
+  };
+
   // 1. 综合状态概览 API
   app.get('/api/overview', (c) => {
     const status = scheduler.getStatus();
     const config = scheduler.getConfig();
-    const profile = db.getLatestProfile();
-    const avatarHistory = db.getAvatarHistory(profile?.userId);
-    const ipHistory = db.getIpHistory(profile?.userId);
-    const profileFieldHistory = db.getProfileFieldHistory(profile?.userId);
-    const stats = db.getArchiveStats();
-    const recentEvents = db.getRecentEvents(60);
+    const activeUserId = getActiveUserId();
+    const profile = activeUserId ? db.getLatestProfile(activeUserId) : null;
+    const avatarHistory = activeUserId ? db.getAvatarHistory(activeUserId) : [];
+    const ipHistory = activeUserId ? db.getIpHistory(activeUserId) : [];
+    const profileFieldHistory = activeUserId ? db.getProfileFieldHistory(activeUserId) : [];
+    const stats = activeUserId
+      ? db.getArchiveStats(activeUserId)
+      : {
+          totalNotes: 0,
+          activeNotes: 0,
+          deletedNotes: 0,
+          editedNotes: 0,
+          baselineNotes: 0,
+          totalComments: 0,
+          activeComments: 0,
+          deletedComments: 0,
+          comparisonsCount: 0,
+          reconciliationsCount: 0,
+          ipHistoryCount: 0,
+          ipChangeCount: 0,
+          profileFieldHistoryCount: 0,
+          profileFieldChangeCount: 0,
+        };
+    const recentEvents = activeUserId ? db.getRecentEvents(60, undefined, activeUserId) : [];
     return c.json({
       ok: true,
       storageRoot: STORAGE_ROOT,
@@ -80,10 +110,10 @@ export function createWebApp(db: MonitorDatabase, scheduler: MonitorScheduler): 
 
   // 1.5 IP 属地检测与本地变更历史 API
   app.get('/api/ip-history', (c) => {
-    const profile = db.getLatestProfile();
-    const userId = c.req.query('userId') || profile?.userId || undefined;
+    const userId = c.req.query('userId') || getActiveUserId() || undefined;
+    const profile = userId ? db.getLatestProfile(userId) : null;
     const limit = Number(c.req.query('limit') || 100);
-    const history = db.getIpHistory(userId, limit);
+    const history = userId ? db.getIpHistory(userId, limit) : [];
     const latestProfileIp = userId ? db.getLatestIpRecord(userId, 'PROFILE') : null;
     const totalChanges = history.filter((item) => item.previousIp !== null).length;
     return c.json({
@@ -98,15 +128,15 @@ export function createWebApp(db: MonitorDatabase, scheduler: MonitorScheduler): 
 
   // 1.6 账号资料（名字 / 性别 / 个性签名）变更历史 API
   app.get('/api/profile-history', (c) => {
-    const profile = db.getLatestProfile();
-    const userId = c.req.query('userId') || profile?.userId || undefined;
+    const userId = c.req.query('userId') || getActiveUserId() || undefined;
+    const profile = userId ? db.getLatestProfile(userId) : null;
     const rawField = (c.req.query('field') || '').toUpperCase();
     const field =
       rawField === 'NICKNAME' || rawField === 'GENDER' || rawField === 'BIO'
         ? rawField
         : undefined;
     const limit = Number(c.req.query('limit') || 100);
-    const history = db.getProfileFieldHistory(userId, field, limit);
+    const history = userId ? db.getProfileFieldHistory(userId, field, limit) : [];
     const totalChanges = history.filter((item) => item.oldValue !== null).length;
     return c.json({
       ok: true,
@@ -125,8 +155,8 @@ export function createWebApp(db: MonitorDatabase, scheduler: MonitorScheduler): 
   // 2. 本地永久笔记存档列表 API（支持筛选 ALL / ACTIVE / DELETED / BASELINE）
   app.get('/api/notes', (c) => {
     const filter = c.req.query('filter') || 'ALL';
-    const profile = db.getLatestProfile();
-    let notes = db.getAllNotes(profile?.userId);
+    const userId = getActiveUserId();
+    let notes = userId ? db.getAllNotes(userId) : [];
     if (filter === 'DELETED') {
       notes = notes.filter((n) => n.status === 'DELETED' || n.status === 'SUSPECTED_DELETED');
     } else if (filter === 'EDITED') {
@@ -155,20 +185,25 @@ export function createWebApp(db: MonitorDatabase, scheduler: MonitorScheduler): 
   app.get('/api/comparisons', (c) => {
     const compareType = c.req.query('type') || undefined;
     const dateKey = c.req.query('date') || undefined;
-    const records = db.getComparisonRecords({
-      compareType: compareType === 'ALL' ? undefined : compareType,
-      dateKey: dateKey || undefined,
-      limit: 150,
-    });
+    const activeUserId = getActiveUserId();
+    const records = activeUserId
+      ? db.getComparisonRecords({
+          userId: activeUserId,
+          compareType: compareType === 'ALL' ? undefined : compareType,
+          dateKey: dateKey || undefined,
+          limit: 150,
+        })
+      : [];
     return c.json({ ok: true, records });
   });
 
   // 4. 次日0点汇总与时间对照报告 API
   app.get('/api/daily-report', (c) => {
     const dateKey = c.req.query('date') || getYesterdayDateKey();
-    const report = db.getDailyReport(dateKey);
-    const availableDates = db.listDailyReportDates();
-    const reconciliations = db.getTimeReconciliations(dateKey);
+    const activeUserId = getActiveUserId();
+    const report = activeUserId ? db.getDailyReport(dateKey, activeUserId) : null;
+    const availableDates = activeUserId ? db.listDailyReportDates(activeUserId) : [];
+    const reconciliations = activeUserId ? db.getTimeReconciliations(dateKey, activeUserId) : [];
     return c.json({
       ok: true,
       dateKey,

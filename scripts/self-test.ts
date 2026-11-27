@@ -27,6 +27,7 @@ async function runSelfTest(): Promise<void> {
   console.log('==============================================================');
 
   const db = new MonitorDatabase(':memory:');
+  let scheduler: MonitorScheduler | null = null;
   const testConfig: AppConfig = {
     ...DEFAULT_CONFIG,
     targetProfileUrl: 'https://www.xiaohongshu.com/user/profile/test_uid_001',
@@ -477,7 +478,7 @@ async function runSelfTest(): Promise<void> {
     // ------------------------------------------------------------------
     // 测试 5：Web 控制台 API 路由连通性校验
     // ------------------------------------------------------------------
-    const scheduler = new MonitorScheduler(db, testConfig);
+    scheduler = new MonitorScheduler(db, testConfig);
     const app = createWebApp(db, scheduler);
 
     const rOverview = await app.request('/api/overview');
@@ -780,10 +781,160 @@ async function runSelfTest(): Promise<void> {
     assert.equal(testMailOffJson.ok, false, '未配置 QQ 邮箱时测试邮件接口应返回 ok=false');
     console.log('✓ [通过] 6. 三态分层选帖、评论者缓存防重查与 QQ 邮箱 SMTPS 通知通道校验');
 
+    // ------------------------------------------------------------------
+    // 测试 7：切换监控目标账号后全维度完全隔离 & 0->1 篇笔记详情抓取校验
+    // ------------------------------------------------------------------
+    // 7.1 0 篇历史笔记 -> 发现第 1 篇笔记时，轻量模式必须进详情页抓取
+    const zeroToOneSel = selectNotesToInspect({
+      mode: 'PROFILE_LIGHT',
+      catalogNotes: [mockCatalog[0]],
+      knownNoteSnapshots: {},
+      knownProfileInteractionNum: 0,
+      currentProfileInteractionNum: 10,
+    });
+    assert.deepEqual(
+      Array.from(zeroToOneSel.inspectIds),
+      ['n_1'],
+      '历史 0 篇笔记变为 1 篇笔记时，轻量主页模式必须进入该笔记详情页'
+    );
+
+    // 7.2 切换到全新账号 test_uid_002（尚未首次采集前）-> 统计、动态、备份、汇总必须全部归零，不继承账号 A
+    const cfgUserB: AppConfig = {
+      ...testConfig,
+      targetProfileUrl: 'https://www.xiaohongshu.com/user/profile/test_uid_002',
+    };
+    scheduler.reloadConfig(cfgUserB);
+    scheduler.pauseManual(); // 防止测试中触发后台计时器
+
+    const rOvEmptyB = await app.request('/api/overview');
+    const ovEmptyB = (await rOvEmptyB.json()) as {
+      profile: unknown;
+      stats: { totalNotes: number; totalComments: number; comparisonsCount: number };
+      recentEvents: unknown[];
+      ipHistory: unknown[];
+      avatarHistory: unknown[];
+      profileFieldHistory: unknown[];
+    };
+    assert.equal(ovEmptyB.profile, null, '切到未采集过的新账号时 profile 应为 null，不残留旧账号');
+    assert.equal(ovEmptyB.stats.totalNotes, 0, '新账号笔记数应为 0，不继承旧账号');
+    assert.equal(ovEmptyB.stats.totalComments, 0, '新账号评论数应为 0，不继承旧账号');
+    assert.equal(ovEmptyB.stats.comparisonsCount, 0, '新账号对比记录数应为 0');
+    assert.equal(ovEmptyB.recentEvents.length, 0, '新账号动态列表应为空，不继承旧账号动态');
+    assert.equal(ovEmptyB.ipHistory.length, 0);
+    assert.equal(ovEmptyB.avatarHistory.length, 0);
+    assert.equal(ovEmptyB.profileFieldHistory.length, 0);
+
+    const rNotesEmptyB = await app.request('/api/notes');
+    const notesEmptyB = (await rNotesEmptyB.json()) as { notes: unknown[] };
+    assert.equal(notesEmptyB.notes.length, 0, '新账号本地备份列表应为空');
+
+    const rCompEmptyB = await app.request('/api/comparisons');
+    const compEmptyB = (await rCompEmptyB.json()) as { records: unknown[] };
+    assert.equal(compEmptyB.records.length, 0, '新账号变动对比列表应为空');
+
+    const rRepEmptyB = await app.request('/api/daily-report?date=2099-05-01');
+    const repEmptyB = (await rRepEmptyB.json()) as { report: unknown; reconciliations: unknown[] };
+    assert.equal(repEmptyB.report, null, '新账号不应继承旧账号的每日汇总报告');
+    assert.equal(repEmptyB.reconciliations.length, 0, '新账号不应继承旧账号的时间核对项');
+
+    // 7.3 新账号 test_uid_002 完成首次备份（1 篇笔记、0 条评论）-> 统计与列表严格为 1 篇笔记 0 评论，建档文案不带旧账号评论数
+    const userBBaselineIso = new Date(2099, 4, 2, 10, 0, 0).toISOString();
+    const userBRes = await processCollectResult(
+      {
+        status: 'OK',
+        isFullCatalogScan: true,
+        profile: {
+          userId: 'test_uid_002',
+          redId: 'xhs_user_b',
+          nickname: '单笔记账号B',
+          gender: '男',
+          avatar: 'https://example.com/avatar_b.webp',
+          desc: '只有一篇笔记',
+          ipLocation: '江苏',
+          followsRaw: '10',
+          followsNum: 10,
+          fansRaw: '20',
+          fansNum: 20,
+          interactionRaw: '38',
+          interactionNum: 38,
+        },
+        notes: [
+          {
+            noteId: 'selftest_userb_only_note',
+            xsecToken: 'tok_b1',
+            title: '账号B的唯一一篇笔记',
+            desc: '正文内容',
+            noteType: 'normal',
+            publishedAt: new Date(2099, 4, 1, 12, 0, 0).getTime(),
+            updatedAt: new Date(2099, 4, 1, 12, 0, 0).getTime(),
+            renderedTimeText: '昨天 12:00 江苏',
+            ipLocation: '江苏',
+            likedRaw: '38',
+            likedNum: 38,
+            collectedRaw: '5',
+            collectedNum: 5,
+            commentRaw: '0',
+            commentNum: 0,
+            coverUrl: 'https://example.com/b1.webp',
+            imageUrls: ['https://example.com/b1.webp'],
+            detailLoaded: true,
+          },
+        ],
+        noteComments: new Map(),
+      },
+      db,
+      cfgUserB,
+      { skipMediaDownload: true, overrideNowIso: userBBaselineIso }
+    );
+    assert.equal(userBRes.isBaselineRun, true);
+    assert.ok(
+      userBRes.events[0]?.body.includes('1 篇笔记') &&
+        userBRes.events[0]?.body.includes('0 条历史评论'),
+      `账号 B 首次建档文案应准确报告自身 1 篇笔记 0 条评论，实际为: ${userBRes.events[0]?.body}`
+    );
+
+    const rOvB = await app.request('/api/overview');
+    const ovB = (await rOvB.json()) as {
+      profile: { userId: string };
+      stats: { totalNotes: number; totalComments: number };
+      recentEvents: Array<{ userId?: string }>;
+    };
+    assert.equal(ovB.profile.userId, 'test_uid_002');
+    assert.equal(ovB.stats.totalNotes, 1, '账号 B 笔记数应严格为 1');
+    assert.equal(ovB.stats.totalComments, 0, '账号 B 评论数应严格为 0');
+    assert.equal(ovB.recentEvents.length, 1, '账号 B 动态应仅含自身 1 条建档动态');
+
+    // 7.4 切回账号 A（test_uid_001）-> 仍记得已完成首次建档，且数据与日报完整保留互不串台
+    scheduler.reloadConfig(testConfig);
+    scheduler.pauseManual();
+    assert.equal(
+      db.isBaselineCompletedForUser('test_uid_001'),
+      true,
+      '切回原账号 A 后仍应记得已完成首次建档，不应重复建档'
+    );
+    const rOvBackA = await app.request('/api/overview');
+    const ovBackA = (await rOvBackA.json()) as {
+      profile: { userId: string };
+      stats: { totalNotes: number; totalComments: number };
+      recentEvents: Array<{ userId?: string }>;
+    };
+    assert.equal(ovBackA.profile.userId, 'test_uid_001');
+    assert.equal(ovBackA.stats.totalNotes, 3, '切回账号 A 应准确恢复其全部 3 篇笔记统计');
+    assert.equal(ovBackA.stats.totalComments, 3, '切回账号 A 应准确恢复其全部 3 条评论统计');
+    assert.ok(
+      ovBackA.recentEvents.every((e) => e.userId === 'test_uid_001'),
+      '切回账号 A 后动态列表绝不能混入账号 B 的动态'
+    );
+    const rRepBackA = await app.request('/api/daily-report?date=2099-05-01');
+    const repBackA = (await rRepBackA.json()) as { report: { account: { userId: string } } | null };
+    assert.equal(repBackA.report?.account.userId, 'test_uid_001', '账号 A 的历史日报应完整保留');
+    console.log('✓ [通过] 7. 多账号切换全维度数据隔离、切回免重建档 & 0→1 篇笔记详情抓取校验');
+
     console.log('==============================================================');
-    console.log('  全部 6 大核心测试场景 100% 通过！');
+    console.log('  全部 7 大核心测试场景 100% 通过！');
     console.log('==============================================================');
   } finally {
+    scheduler?.stop();
     db.close();
     for (const p of cleanupPaths) {
       if (fs.existsSync(p)) {

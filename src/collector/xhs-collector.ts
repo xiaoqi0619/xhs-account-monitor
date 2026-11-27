@@ -61,7 +61,7 @@ export function selectNotesToInspect(params: {
     if (catalogIdSet.has(id)) changedIds.add(id);
   }
 
-  if (knownNoteSnapshots && Object.keys(knownNoteSnapshots).length > 0) {
+  if (knownNoteSnapshots) {
     for (const n of catalogNotes) {
       const prev = knownNoteSnapshots[n.noteId];
       if (!prev) {
@@ -421,6 +421,7 @@ export class XhsCollector {
       const apiCommentsByNote = new Map<string, Map<string, CommentSnapshot>>();
       const rootCommentHasMoreMap = new Map<string, boolean>();
       let userPostedHasMore = true;
+      let userPostedResponseSeen = false;
 
       const ensureCommentBucket = (noteId: string): Map<string, CommentSnapshot> => {
         let bucket = apiCommentsByNote.get(noteId);
@@ -455,6 +456,7 @@ export class XhsCollector {
               data?: { has_more?: boolean; notes?: Array<Record<string, any>> };
             };
             if (json?.data) {
+              userPostedResponseSeen = true;
               if (typeof json.data.has_more === 'boolean') {
                 userPostedHasMore = json.data.has_more;
               }
@@ -578,6 +580,29 @@ export class XhsCollector {
       });
       await sleep(randomBetween(2200, 3400));
 
+      // 等待首屏作品接口或 DOM 笔记卡片/空态渲染完成（解决仅 1 篇笔记或网络略慢时误判为 0 篇的问题）
+      let domExplicitEmpty = false;
+      for (let waitRound = 0; waitRound < 12; waitRound++) {
+        if (apiNotesMap.size > 0 || userPostedResponseSeen) break;
+        const pageState = await page.evaluate(() => {
+          const cardsCount = document.querySelectorAll('section.note-item').length;
+          const emptyTxt =
+            document.querySelector('.empty-container, .no-data, [class*="empty"]')?.textContent ||
+            '';
+          const bodyTxt = document.body?.innerText || '';
+          const isExplicitEmpty =
+            /还没有发布|暂无笔记|暂未发布|还没有笔记/.test(emptyTxt) ||
+            /TA\s*还没有发布笔记|还没有发布过笔记/.test(bodyTxt);
+          return { cardsCount, isExplicitEmpty };
+        });
+        if (pageState.cardsCount > 0) break;
+        if (pageState.isExplicitEmpty) {
+          domExplicitEmpty = true;
+          break;
+        }
+        await sleep(400);
+      }
+
       // 2. 检测是否遇到登录弹窗或安全验证拦截（绝不自动绕过验证码，立即挂起通知人工处理）
       const authGate = await this.checkAuthOrCaptchaGate(page);
       if (authGate.blocked) {
@@ -657,15 +682,33 @@ export class XhsCollector {
           options.onProgress?.(`已加载主页笔记 ${apiNotesMap.size} 篇...`);
         }
 
-        if (!userPostedHasMore || (reachedBottom && unchangedRounds >= 2) || unchangedRounds >= 4) {
+        if (
+          (userPostedResponseSeen && !userPostedHasMore) ||
+          (apiNotesMap.size > 0 && reachedBottom && unchangedRounds >= 2) ||
+          (domExplicitEmpty && unchangedRounds >= 1) ||
+          unchangedRounds >= 4
+        ) {
           break;
         }
       }
 
-      const isFullCatalogScan =
-        !userPostedHasMore ||
-        (needFullScroll && unchangedRounds >= 2) ||
-        apiNotesMap.size === 0;
+      const isFullCatalogScan = userPostedResponseSeen
+        ? !userPostedHasMore || (needFullScroll && unchangedRounds >= 2)
+        : domExplicitEmpty || (apiNotesMap.size > 0 && needFullScroll && unchangedRounds >= 2);
+
+      // 防护：首次建档时如果既没收到作品列表接口、又没见到空态提示、且账号已有赞藏却抓到 0 篇，视为页面未加载完，稍后重试而非锁定空基线
+      if (
+        options.mode === 'BASELINE' &&
+        apiNotesMap.size === 0 &&
+        !userPostedResponseSeen &&
+        !domExplicitEmpty &&
+        (initialProfileAndNotes.profile?.interactionNum || 0) > 0
+      ) {
+        return {
+          status: 'ERROR',
+          reason: '主页作品列表未加载完成（获赞数非零但未抓到笔记），稍后将自动重试首次备份',
+        };
+      }
 
       // 锁定目标账号本人的主页作品集合，后续访问任何评论者主页都不会污染此列表
       catalogPhaseFinished = true;

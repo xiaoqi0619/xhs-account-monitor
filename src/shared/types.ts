@@ -182,6 +182,7 @@ export type EventType =
 
 export interface MonitorEvent {
   id?: number;
+  userId?: string;
   eventType: EventType;
   title: string;
   body: string;
@@ -248,6 +249,7 @@ export interface AvatarHistoryItem {
 
 export interface ComparisonRecord {
   id?: number;
+  userId?: string;
   dateKey: string;
   compareType: CompareType;
   noteId: string;
@@ -286,6 +288,7 @@ export type ReconciliationStatus =
 
 export interface TimeReconciliationItem {
   id?: number;
+  userId?: string;
   targetDateKey: string;
   itemType: 'NOTE' | 'COMMENT';
   targetId: string;

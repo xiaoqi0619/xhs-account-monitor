@@ -2083,6 +2083,7 @@ export function renderDashboardHtml(): string {
 
     let serverClockOffsetMs = 0;
     let lastAutoTriggeredTarget = '';
+    let lastActiveTargetUid = '';
 
     function fmtClockHMS(iso) {
       if (!iso) return '--:--:--';
@@ -2450,9 +2451,21 @@ export function renderDashboardHtml(): string {
           document.getElementById('ovFans').textContent = prof.fansRaw || '0';
           document.getElementById('ovInteraction').textContent = prof.interactionRaw || '0';
         } else {
+          document.getElementById('wsAvatar').textContent = 'X';
           document.getElementById('wsName').textContent = hasTarget ? '等待首次采集' : 'XHS Monitor';
           document.getElementById('wsSub').textContent = hasTarget ? mInfo[0] : '未配置目标';
         }
+
+        const cfgUidMatch = String(cfg.targetProfileUrl || '').match(/\\/user\\/profile\\/([a-zA-Z0-9_-]+)/);
+        const curTargetUid = (cfgUidMatch && cfgUidMatch[1]) || (prof && prof.userId) || '';
+        if (lastActiveTargetUid && curTargetUid && lastActiveTargetUid !== curTargetUid) {
+          cachedNotes = [];
+          lastAutoTriggeredTarget = '';
+          if (activeTab === 'comparisons') loadComparisons();
+          if (activeTab === 'midnight') loadDailyReport();
+          if (activeTab === 'archive' && activeArchiveSub === 'notes') loadArchiveNotes();
+        }
+        if (curTargetUid) lastActiveTargetUid = curTargetUid;
 
         // KPI Strip & Sidebar Badges
         document.getElementById('statNotes').textContent = String(stats.totalNotes || 0);
@@ -2518,7 +2531,10 @@ export function renderDashboardHtml(): string {
         } else {
           listEl.innerHTML = events.map(function(ev) {
             const info = EVENT_LABELS[ev.eventType] || [ev.eventType, 'accent'];
-            const clickAttr = ev.noteId && !String(ev.noteId).startsWith('ip_') && !String(ev.noteId).startsWith('avatar_')
+            const clickAttr = ev.noteId &&
+              !String(ev.noteId).startsWith('ip_') &&
+              !String(ev.noteId).startsWith('avatar_') &&
+              !String(ev.noteId).startsWith('profile_')
               ? ' class="event-row clickable" onclick="openNoteDetail(\\'' + esc(ev.noteId) + '\\')"'
               : ' class="event-row"';
             return '<div' + clickAttr + '>' +
@@ -3112,7 +3128,7 @@ export function renderDashboardHtml(): string {
       const nextUrl = document.getElementById('cfg_targetProfileUrl').value.trim();
       const prevUrl = (currentState && currentState.config && currentState.config.targetProfileUrl) || '';
       const extractUid = function(u) {
-        const m = String(u || '').match(/\\/user\\/profile\\/([a-zA-Z0-9]+)/);
+        const m = String(u || '').match(/\\/user\\/profile\\/([a-zA-Z0-9_-]+)/);
         return m ? m[1] : '';
       };
       if (prevUrl && nextUrl && extractUid(prevUrl) && extractUid(nextUrl) && extractUid(prevUrl) !== extractUid(nextUrl)) {
@@ -3155,6 +3171,8 @@ export function renderDashboardHtml(): string {
           body: JSON.stringify(payload)
         }).then(function(r) { return r.json(); });
         if (res.ok) {
+          cachedNotes = [];
+          lastAutoTriggeredTarget = '';
           showToast('配置已保存', 'ok');
           loadOverview();
         } else {

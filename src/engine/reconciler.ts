@@ -8,6 +8,7 @@ import type {
   TimeReconciliationItem,
 } from '../shared/types.ts';
 import {
+  extractUserIdFromProfileUrl,
   formatDateTime,
   formatNicknameWithRedId,
   formatSignedInt,
@@ -31,13 +32,14 @@ function isSameDayRelativeText(txt: string): boolean {
  */
 export function collectNoteIdsNeedingMidnightRefresh(
   db: MonitorDatabase,
-  targetDateKey: string
+  targetDateKey: string,
+  userId?: string
 ): string[] {
   const { startMs, endMs } = getLocalDayBoundsIso(targetDateKey);
   const noteIdSet = new Set<string>();
 
   // 1. 当天首次记录的所有笔记（含首次运行当天刚发的相对时间笔记）
-  const dayNotes = db.getNotesByFirstSeenDate(targetDateKey, true);
+  const dayNotes = db.getNotesByFirstSeenDate(targetDateKey, true, userId);
   for (const n of dayNotes) {
     if (n.status === 'DELETED') continue;
     const pubInDay =
@@ -48,7 +50,7 @@ export function collectNoteIdsNeedingMidnightRefresh(
   }
 
   // 2. 当天出现新评论的所有所属笔记
-  const dayComments = db.getCommentsByFirstSeenDate(targetDateKey, true);
+  const dayComments = db.getCommentsByFirstSeenDate(targetDateKey, true, userId);
   for (const c of dayComments) {
     const createdInDay =
       c.createdAt !== null && c.createdAt >= startMs && c.createdAt <= endMs;
@@ -61,7 +63,7 @@ export function collectNoteIdsNeedingMidnightRefresh(
   }
 
   // 3. 当天发生过编辑的笔记（次日0点可刷新抓取精确「编辑于 昨天 HH:mm」）
-  for (const editedId of db.getEditedNoteIdsForDate(targetDateKey)) {
+  for (const editedId of db.getEditedNoteIdsForDate(targetDateKey, userId)) {
     const editedNote = db.getNote(editedId);
     if (editedNote && editedNote.status !== 'DELETED') {
       noteIdSet.add(editedId);
@@ -94,31 +96,40 @@ export function runMidnightReconcileAndDailySummary(
   const checkedNowMs = new Date(checkedAt).getTime();
   const isNextDayVerified = opts?.isNextDayVerified ?? getLocalDateKey(checkedAt) > targetDateKey;
   const { startMs, endMs } = getLocalDayBoundsIso(targetDateKey);
+  const activeUserId =
+    extractUserIdFromProfileUrl(config.targetProfileUrl) || db.getLatestProfile()?.userId || '';
 
   // 筛选昨日发布/捕获的笔记与评论（兼顾首次运行当天发布的动态）
-  const candidateNotes = db.getNotesByFirstSeenDate(targetDateKey, true).filter((n) => {
-    const pubInDay = n.publishedAt !== null && n.publishedAt >= startMs && n.publishedAt <= endMs;
-    return !n.isBaseline || pubInDay || isSameDayRelativeText(n.firstRenderedTimeText);
-  });
+  const candidateNotes = db
+    .getNotesByFirstSeenDate(targetDateKey, true, activeUserId || undefined)
+    .filter((n) => {
+      const pubInDay = n.publishedAt !== null && n.publishedAt >= startMs && n.publishedAt <= endMs;
+      return !n.isBaseline || pubInDay || isSameDayRelativeText(n.firstRenderedTimeText);
+    });
 
-  const candidateComments = db.getCommentsByFirstSeenDate(targetDateKey, true).filter((c) => {
-    const createdInDay =
-      c.createdAt !== null && c.createdAt >= startMs && c.createdAt <= endMs;
-    return !c.isBaseline || createdInDay || isSameDayRelativeText(c.firstRenderedTimeText);
-  });
+  const candidateComments = db
+    .getCommentsByFirstSeenDate(targetDateKey, true, activeUserId || undefined)
+    .filter((c) => {
+      const createdInDay =
+        c.createdAt !== null && c.createdAt >= startMs && c.createdAt <= endMs;
+      return !c.isBaseline || createdInDay || isSameDayRelativeText(c.firstRenderedTimeText);
+    });
 
   const reconciliations: TimeReconciliationItem[] = [];
 
   // ==================== A. 对照昨日笔记发布时间 ====================
   for (const note of candidateNotes) {
-    const item = reconcileNoteItem(
-      note,
-      targetDateKey,
-      checkedAt,
-      checkedNowMs,
-      config.timeDiffReviewThresholdMinutes,
-      db
-    );
+    const item = {
+      ...reconcileNoteItem(
+        note,
+        targetDateKey,
+        checkedAt,
+        checkedNowMs,
+        config.timeDiffReviewThresholdMinutes,
+        db
+      ),
+      userId: note.userId || activeUserId,
+    };
     db.upsertTimeReconciliation(item);
     reconciliations.push(item);
   }
@@ -126,28 +137,31 @@ export function runMidnightReconcileAndDailySummary(
   // ==================== B. 对照昨日评论发布时间 ====================
   for (const comment of candidateComments) {
     const parentNote = db.getNote(comment.noteId);
-    const item = reconcileCommentItem(
-      comment,
-      parentNote,
-      targetDateKey,
-      checkedAt,
-      checkedNowMs,
-      config.timeDiffReviewThresholdMinutes,
-      db
-    );
+    const item = {
+      ...reconcileCommentItem(
+        comment,
+        parentNote,
+        targetDateKey,
+        checkedAt,
+        checkedNowMs,
+        config.timeDiffReviewThresholdMinutes,
+        db
+      ),
+      userId: parentNote?.userId || activeUserId,
+    };
     db.upsertTimeReconciliation(item);
     reconciliations.push(item);
   }
 
-  const allReconciliations = db.getTimeReconciliations(targetDateKey);
+  const allReconciliations = db.getTimeReconciliations(targetDateKey, activeUserId || undefined);
   const needsReviewCount = allReconciliations.filter((r) => r.status === 'NEEDS_REVIEW').length;
   const matchedCount = allReconciliations.filter(
     (r) => r.status === 'MATCHED' || r.status === 'REVIEWED_OK'
   ).length;
 
   // ==================== C. 汇总昨日全天动态与对比记录 ====================
-  const latestProfile = db.getLatestProfile();
-  const userId = latestProfile?.userId || '';
+  const latestProfile = activeUserId ? db.getLatestProfile(activeUserId) : db.getLatestProfile();
+  const userId = activeUserId || latestProfile?.userId || '';
   const bounds = userId
     ? db.getProfileDayBounds(userId, targetDateKey)
     : { first: null, last: null };
@@ -155,9 +169,9 @@ export function runMidnightReconcileAndDailySummary(
   const pStart = bounds.first || latestProfile;
   const pEnd = bounds.last || latestProfile;
 
-  const dayEvents = db.getEventsForDate(targetDateKey);
+  const dayEvents = db.getEventsForDate(targetDateKey, userId || undefined);
   const dayComparisons = db
-    .getComparisonRecords({ dateKey: targetDateKey, limit: 500 })
+    .getComparisonRecords({ userId: userId || undefined, dateKey: targetDateKey, limit: 500 })
     .reverse();
 
   const hourlyActivity = new Array<number>(24).fill(0);
@@ -286,8 +300,9 @@ export function runMidnightReconcileAndDailySummary(
   const ipStart = pStart?.ipLocation || '';
   const ipEnd = pEnd?.ipLocation || '';
 
+  const patrolRunsCount = db.countPatrolRunsForDate(targetDateKey, userId || undefined);
   const insights: string[] = [
-    `昨日（${targetDateKey}）共完成 ${db.countPatrolRunsForDate(targetDateKey)} 次自动巡检，捕获动态事件 ${totalActivityEvents} 起。`,
+    `昨日（${targetDateKey}）共完成 ${patrolRunsCount} 次自动巡检，捕获动态事件 ${totalActivityEvents} 起。`,
     `账号净变化：关注 ${formatSignedInt(followsEnd - followsStart)}，粉丝 ${formatSignedInt(
       fansEnd - fansStart
     )}，获赞与收藏 ${formatSignedInt(interEnd - interStart)}；IP 属地：${
@@ -311,7 +326,7 @@ export function runMidnightReconcileAndDailySummary(
     generatedAt: checkedAt,
     isNextDayVerified,
     account: {
-      userId: latestProfile?.userId || '',
+      userId: userId || latestProfile?.userId || '',
       nickname: latestProfile?.nickname || '未知账号',
       redId: latestProfile?.redId || '',
       followsStart,
@@ -330,7 +345,7 @@ export function runMidnightReconcileAndDailySummary(
       ipChangeEvents: ipChangesTotal,
     },
     counts: {
-      patrolRuns: db.countPatrolRunsForDate(targetDateKey),
+      patrolRuns: patrolRunsCount,
       totalActivityEvents,
       newNotes: newNotesCount,
       updatedNotes: updatedNotesCount,
@@ -360,11 +375,13 @@ export function runMidnightReconcileAndDailySummary(
 
   db.saveDailyReport(reportDraft);
   if (isNextDayVerified) {
+    if (userId) db.setMeta(`last_reconciled_date:${userId}`, targetDateKey);
     db.setMeta('last_reconciled_date', targetDateKey);
   }
 
   const emittedEvents: MonitorEvent[] = [];
   const reportEv = db.insertEvent({
+    userId,
     eventType: 'DAILY_REPORT',
     title: `【次日0点汇总与时间对照】${targetDateKey}`,
     body: summaryText,
@@ -379,6 +396,7 @@ export function runMidnightReconcileAndDailySummary(
 
   if (needsReviewCount > 0) {
     const alertEv = db.insertEvent({
+      userId,
       eventType: 'TIME_REVIEW_ALERT',
       title: `【时间对照偏差提醒】${targetDateKey} 有 ${needsReviewCount} 项需关注`,
       body: `次日0点复核「昨天 HH:mm」具体时间时，发现 ${needsReviewCount} 条内容的实际时间与当天本地记录时间相差超过阈值或存在二次编辑，请在控制台查看对照表。`,

@@ -222,7 +222,7 @@ export function saveConfig(partial: Partial<AppConfig>): AppConfig {
 
 export function extractUserIdFromProfileUrl(profileUrl: string): string | null {
   if (!profileUrl) return null;
-  const match = profileUrl.match(/\/user\/profile\/([a-zA-Z0-9]+)/);
+  const match = profileUrl.match(/\/user\/profile\/([a-zA-Z0-9_-]+)/);
   return match ? match[1] : null;
 }
 

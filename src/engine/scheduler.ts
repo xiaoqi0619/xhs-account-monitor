@@ -48,6 +48,7 @@ export class MonitorScheduler {
   private countdownWatchdogTimer: ReturnType<typeof setInterval> | null = null;
   private midnightTickTimer: ReturnType<typeof setInterval> | null = null;
   private reconcilingLock = false;
+  private pendingTargetSwitch = false;
 
   constructor(db: MonitorDatabase, initialConfig?: AppConfig) {
     this.db = db;
@@ -56,12 +57,23 @@ export class MonitorScheduler {
     this.notifier = new NotificationHub(this.config);
   }
 
+  private getTargetUid(): string | null {
+    return (
+      extractUserIdFromProfileUrl(this.config.targetProfileUrl) ||
+      this.db.getLatestProfile()?.userId ||
+      null
+    );
+  }
+
   getConfig(): AppConfig {
     return this.config;
   }
 
   reloadConfig(newConfig: AppConfig): void {
     const oldUrl = this.config.targetProfileUrl;
+    const oldUid = extractUserIdFromProfileUrl(oldUrl);
+    const newUid = extractUserIdFromProfileUrl(newConfig.targetProfileUrl);
+    const targetSwitched = oldUrl !== newConfig.targetProfileUrl && oldUid !== newUid;
     const intervalChanged =
       this.config.lightCheckMinMinutes !== newConfig.lightCheckMinMinutes ||
       this.config.lightCheckMaxMinutes !== newConfig.lightCheckMaxMinutes ||
@@ -73,12 +85,40 @@ export class MonitorScheduler {
     this.collector.updateConfig(newConfig);
     this.notifier = new NotificationHub(newConfig);
 
-    if (this.config.targetProfileUrl && this.mode === 'IDLE') {
-      this.start();
-    } else if (oldUrl !== newConfig.targetProfileUrl && newConfig.targetProfileUrl && !this.isRunningNow) {
-      this.nextFullScanAtMs = null;
+    if (!this.config.targetProfileUrl) {
+      if (this.patrolTimer) {
+        clearTimeout(this.patrolTimer);
+        this.patrolTimer = null;
+      }
+      this.mode = 'IDLE';
+      this.burstRemaining = 0;
       this.recentChangedNoteIds = [];
-      this.scheduleNext(1500);
+      this.nextRunAt = null;
+      this.nextRunKind = null;
+      this.nextRunDelayMs = null;
+      this.nextFullScanAtMs = null;
+      this.progressText = '尚未填写监控目标链接';
+      return;
+    }
+
+    if (this.mode === 'IDLE') {
+      this.start();
+    } else if (targetSwitched) {
+      // 切换监控目标账号：彻底清空上一个账号的调度高频状态与变更缓存，互不影响
+      this.previousModeBeforeRun = 'NORMAL';
+      this.burstRemaining = 0;
+      this.recentChangedNoteIds = [];
+      this.nextFullScanAtMs = null;
+      this.lastError = null;
+      this.lastChangesCount = 0;
+      if (this.isRunningNow) {
+        this.pendingTargetSwitch = true;
+        this.progressText = '已切换目标账号，等待当前检查结束后立即开始新账号监控...';
+      } else {
+        this.mode = 'NORMAL';
+        this.progressText = '已切换目标账号，即将开始采集...';
+        this.scheduleNext(1500);
+      }
     } else if (
       intervalChanged &&
       !this.isRunningNow &&
@@ -140,7 +180,8 @@ export class MonitorScheduler {
 
     this.mode = 'NORMAL';
     this.progressText = '准备就绪，即将开始检查...';
-    const lastFull = this.db.getMeta('last_full_audit_at');
+    const targetUid = this.getTargetUid();
+    const lastFull = targetUid ? this.db.getMeta(`last_full_audit_at:${targetUid}`) : null;
     if (lastFull) {
       const elapsed = Date.now() - new Date(lastFull).getTime();
       const targetFullGap = this.randomRangeMinutesMs(
@@ -197,10 +238,7 @@ export class MonitorScheduler {
   }
 
   getStatus(): RuntimeStatus {
-    const targetUid =
-      extractUserIdFromProfileUrl(this.config.targetProfileUrl) ||
-      this.db.getLatestProfile()?.userId ||
-      null;
+    const targetUid = this.getTargetUid();
     const isBaselineDone = this.db.isBaselineCompletedForUser(targetUid);
     return {
       mode: this.mode,
@@ -209,7 +247,7 @@ export class MonitorScheduler {
       isRunningNow: this.isRunningNow,
       progressText: this.progressText,
       isBaselineDone,
-      baselineCompletedAt: this.db.getMeta('baseline_completed_at'),
+      baselineCompletedAt: this.db.getBaselineCompletedAt(targetUid),
       lastRunAt: this.lastRunAt,
       lastSuccessAt: this.lastSuccessAt,
       nextRunAt: this.nextRunAt,
@@ -218,7 +256,9 @@ export class MonitorScheduler {
       nextRunDelayMs: this.nextRunDelayMs,
       serverNow: nowIso(),
       nextMidnightSummaryTime: this.config.nextDaySummaryTime,
-      lastReconciledDate: this.db.getMeta('last_reconciled_date'),
+      lastReconciledDate: targetUid
+        ? this.db.getMeta(`last_reconciled_date:${targetUid}`)
+        : null,
       lastError: this.lastError,
       totalRuns: this.totalRuns,
       lastChangesCount: this.lastChangesCount,
@@ -374,12 +414,18 @@ export class MonitorScheduler {
         .filter((n) => n.status === 'SUSPECTED_DELETED')
         .map((n) => n.noteId);
 
+      // 若本地已有笔记缺失详情元信息（如之前仅抓到主页卡片），自动优先补抓详情与评论
+      const incompleteDetailIds = storedActiveNotes
+        .filter((n) => !n.verifiedTimeText && !n.firstRenderedTimeText && n.publishedAt === null)
+        .map((n) => n.noteId);
+
       const latestProf = targetUid ? this.db.getLatestProfile(targetUid) : null;
 
       const mergedPriorityIds = Array.from(
         new Set([
           ...(priorityNoteIds || []),
           ...suspectedIds,
+          ...incompleteDetailIds,
           ...(collectMode === 'BURST_CHECK' ? this.recentChangedNoteIds : []),
         ])
       );
@@ -415,6 +461,7 @@ export class MonitorScheduler {
         this.nextRunAt = null;
 
         this.db.recordPatrolRun({
+          userId: targetUid || '',
           runType: collectMode,
           status: 'NEEDS_AUTH',
           notesScanned: 0,
@@ -425,6 +472,7 @@ export class MonitorScheduler {
         });
 
         const alertEv = this.db.insertEvent({
+          userId: targetUid || '',
           eventType: 'SYSTEM_ALERT',
           title: '【监控需登录/验证确认】小红书监控已自动挂起',
           body: this.lastError,
@@ -444,6 +492,7 @@ export class MonitorScheduler {
         this.mode = this.previousModeBeforeRun;
         this.progressText = `本轮异常（将在下一周期自动重试）：${this.lastError}`;
         this.db.recordPatrolRun({
+          userId: targetUid || '',
           runType: collectMode,
           status: 'ERROR',
           notesScanned: 0,
@@ -452,16 +501,25 @@ export class MonitorScheduler {
           errorMsg: this.lastError,
           startedAt,
         });
-        this.scheduleNext();
+        const retryDelayMs =
+          collectMode === 'BASELINE'
+            ? this.lastError.includes('占用')
+              ? 15_000
+              : 60_000
+            : undefined;
+        this.scheduleNext(retryDelayMs);
         return { ok: false, message: this.lastError };
       }
 
       // 执行全量存档或删改/评论对比
       this.progressText = '正在保存照片并对比本地历史存档数据...';
       const summary = await processCollectResult(collectRes, this.db, this.config);
+      const resolvedUid = collectRes.profile?.userId || targetUid || '';
 
       if (collectMode === 'BASELINE' || collectMode === 'FULL_SCAN') {
-        this.db.setMeta('last_full_audit_at', nowIso());
+        if (resolvedUid) {
+          this.db.setMeta(`last_full_audit_at:${resolvedUid}`, nowIso());
+        }
         this.nextFullScanAtMs = this.computeNextFullScanMs();
       }
 
@@ -473,6 +531,7 @@ export class MonitorScheduler {
       this.lastChangesCount = summary.events.length;
 
       this.db.recordPatrolRun({
+        userId: resolvedUid,
         runType: collectMode,
         status: 'OK',
         notesScanned: summary.notesProcessed,
@@ -531,10 +590,16 @@ export class MonitorScheduler {
       this.lastError = msg;
       this.mode = this.previousModeBeforeRun;
       this.progressText = `运行出错：${msg}`;
-      this.scheduleNext();
+      const needBase = !this.db.isBaselineCompletedForUser(this.getTargetUid());
+      this.scheduleNext(needBase ? 60_000 : undefined);
       return { ok: false, message: msg };
     } finally {
       this.isRunningNow = false;
+      if (this.pendingTargetSwitch && this.config.targetProfileUrl) {
+        this.pendingTargetSwitch = false;
+        this.mode = 'NORMAL';
+        this.scheduleNext(1500);
+      }
     }
   }
 
@@ -552,19 +617,22 @@ export class MonitorScheduler {
     ).padStart(2, '0')}`;
     if (curHHMM < this.config.nextDaySummaryTime) return;
 
+    const targetUid = this.getTargetUid();
+    if (!targetUid) return;
+
     const yesterdayKey = getYesterdayDateKey(now);
-    const lastReconciled = this.db.getMeta('last_reconciled_date');
+    const lastReconciled = this.db.getMeta(`last_reconciled_date:${targetUid}`);
     if (lastReconciled === yesterdayKey) return;
 
-    // 检查昨天是否有监控记录（首次安装当天没有昨天记录则跳过空跑，直接标记）
+    // 检查昨天是否有该目标账号的监控记录（首次监控当天没有昨天记录则跳过空跑，直接标记）
     const hasYesterdayData =
-      this.db.countPatrolRunsForDate(yesterdayKey) > 0 ||
-      this.db.getNotesByFirstSeenDate(yesterdayKey, true).length > 0 ||
-      this.db.getCommentsByFirstSeenDate(yesterdayKey, true).length > 0 ||
-      this.db.getEventsForDate(yesterdayKey).length > 0;
+      this.db.countPatrolRunsForDate(yesterdayKey, targetUid) > 0 ||
+      this.db.getNotesByFirstSeenDate(yesterdayKey, true, targetUid).length > 0 ||
+      this.db.getCommentsByFirstSeenDate(yesterdayKey, true, targetUid).length > 0 ||
+      this.db.getEventsForDate(yesterdayKey, targetUid).length > 0;
 
     if (!hasYesterdayData) {
-      this.db.setMeta('last_reconciled_date', yesterdayKey);
+      this.db.setMeta(`last_reconciled_date:${targetUid}`, yesterdayKey);
       return;
     }
 
@@ -584,7 +652,12 @@ export class MonitorScheduler {
     this.reconcilingLock = true;
 
     try {
-      const needRefreshIds = collectNoteIdsNeedingMidnightRefresh(this.db, targetDateKey);
+      const targetUid = this.getTargetUid() || undefined;
+      const needRefreshIds = collectNoteIdsNeedingMidnightRefresh(
+        this.db,
+        targetDateKey,
+        targetUid
+      );
       if (
         refreshOnlineFirst &&
         this.config.targetProfileUrl &&
