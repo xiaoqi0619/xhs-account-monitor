@@ -1,0 +1,34 @@
+# 依赖包目录（上传 GitHub 时忽略，克隆后通过 npm install 恢复，不包含 Node.js 本体）
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Node.js 本地运行时（防误放入项目目录）
+node.exe
+nodejs/
+
+# 个人本地隐私配置文件（含监控目标链接、Bark Key 与 QQ 邮箱授权码，切勿上传公开仓库）
+config/config.local.json
+
+# 本地运行时永久存储的数据（保留目录分类结构 .gitkeep，忽略个人抓取数据与登录态）
+storage/photos/avatars/*
+!storage/photos/avatars/.gitkeep
+storage/photos/notes/*
+!storage/photos/notes/.gitkeep
+storage/photos/comments/*
+!storage/photos/comments/.gitkeep
+storage/database/*
+!storage/database/.gitkeep
+storage/logs/*
+!storage/logs/.gitkeep
+storage/reports/*
+!storage/reports/.gitkeep
+storage/browser-profile/*
+!storage/browser-profile/.gitkeep
+
+# 编译产物与系统临时文件
+dist/
+*.tsbuildinfo
+.DS_Store
+Thumbs.db

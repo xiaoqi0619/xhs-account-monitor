@@ -1,0 +1,25 @@
+{
+  "name": "xhs-account-monitor",
+  "version": "2.0.0",
+  "private": true,
+  "license": "MIT",
+  "description": "小红书账号全量存档、删帖与评论时间对比及次日0点精确时间对照系统",
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.ts",
+    "dev": "node --watch src/main.ts",
+    "login": "node scripts/login.ts",
+    "reconcile": "node scripts/run-reconcile.ts",
+    "test": "node scripts/self-test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.14.0",
+    "hono": "^4.7.0",
+    "playwright-core": "^1.51.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.2"
+  }
+}
